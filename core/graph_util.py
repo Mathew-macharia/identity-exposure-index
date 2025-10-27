@@ -3,6 +3,7 @@
 from gremlin_python.driver.driver_remote_connection import DriverRemoteConnection
 from gremlin_python.process.anonymous_traversal import traversal
 from gremlin_python.process.graph_traversal import __
+from gremlin_python.process.traversal import Order
 from urllib.parse import urlparse
 from datetime import datetime, timezone
 import json
@@ -156,4 +157,33 @@ def save_cloudtrail_data_to_neptune(used_actions_by_role: dict, start_time: date
     finally:
         if g:
             g.close()
+
+def calculate_role_metrics(g, role_arn: str):
+    """
+    Executes Gremlin traversals to get the three required metrics for the I.E.I. formula.
+    """
+    # 1. Total Allowed Actions (T.A.A.): Count of all 'Action' nodes linked by 'PERMITS'
+    taa_query = g.V().has('role', 'arn', role_arn).out('HAS_POLICY').out('PERMITS').dedup().count().next()
+    
+    # 2. Used Actions (U.A.): Count of all 'Action' nodes linked by 'USED_ACTION'
+    ua_query = g.V().has('role', 'arn', role_arn).out('USED_ACTION').dedup().count().next()
+
+    # 3. Days Since Last Use (DSLU): Get the max 'last_seen' property from 'USED_ACTION' edges
+    # If no USED_ACTION edge exists, the role is inactive for the full lookback period (90 days).
+    last_seen_iso = g.V().has('role', 'arn', role_arn).outE('USED_ACTION').values('last_seen').order().by(Order.desc).limit(1).tryNext()
+    
+    if last_seen_iso.isPresent():
+        last_seen_date = datetime.fromisoformat(last_seen_iso.get().replace('Z', '+00:00'))
+        # Calculate days since last use
+        time_diff = datetime.now(timezone.utc) - last_seen_date
+        dslu = min(time_diff.days, 90) # Cap at the lookback window
+    else:
+        # If no usage data exists, assume the maximum risk score
+        dslu = 90
+        
+    return {
+        'total_allowed_actions': taa_query,
+        'used_actions': ua_query,
+        'days_since_last_use': dslu,
+    }
 
