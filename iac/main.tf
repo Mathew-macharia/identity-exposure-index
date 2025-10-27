@@ -113,8 +113,15 @@ resource "aws_iam_role_policy_attachment" "collector_policy_attach" {
 # 1. Package the Python code into a deployable zip file
 data "archive_file" "collector_zip" {
   type        = "zip"
-  source_file = "lambda/collector/collector_handler.py"
+  # Change source_file to source_dir and include the requirements file
+  source_dir  = "lambda/collector" 
   output_path = "lambda/collector/collector_handler.zip"
+  
+  # CRITICAL: This line makes sure Python packages are included
+  # We will rely on a local install for the moment.
+  # For full deployment, we would build a Lambda layer or use Docker.
+  # For now, we package our utility folder and the handler:
+  excludes    = ["test_collector.py"] # Exclude test files
 }
 
 # 2. Define the Lambda Function
