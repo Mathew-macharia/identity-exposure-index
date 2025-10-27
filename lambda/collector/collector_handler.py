@@ -2,10 +2,14 @@
 import json
 import boto3
 # --- New Import ---
+from datetime import datetime, timedelta, timezone
 # We will define this utility module later for graph interactions
-from core.graph_util import save_iam_data_to_neptune 
+from core.graph_util import save_iam_data_to_neptune, save_cloudtrail_data_to_neptune 
 
 CUSTOMER_ROLE_ARN = "arn:aws:iam::[CUSTOMER_ACCOUNT_ID]:role/[ROLE_NAME]"
+
+# Define the lookback window (90 days as per requirement)
+LOOKBACK_DAYS = 90
 
 def assume_customer_role(role_arn: str):
     """
@@ -36,7 +40,7 @@ def assume_customer_role(role_arn: str):
         return customer_session
 
     except Exception as e:
-        print(f"Error assuming role {role_arn}: {e}")
+        # Do not print error here during expected failure cases; logging handles this
         return None
 
 # --- New Function: Collects and Parses IAM Data ---
@@ -101,17 +105,77 @@ def collect_iam_data(session: boto3.Session, account_id: str):
     
     return iam_data
 
+def collect_cloudtrail_usage(session: boto3.Session, account_id: str):
+    """
+    Connects to the customer's CloudTrail service and iterates through
+    recent API calls to determine used actions by IAM roles.
+    """
+    cloudtrail_client = session.client('cloudtrail')
+    
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(days=LOOKBACK_DAYS)
+    
+    used_actions_by_role = {}
+    
+    # We filter by 'ReadOnly' event type to quickly gather API calls. 
+    # For MVP, we use the LookupEvents API for simplicity, though a real system 
+    # would process S3 logs for scale.
+    paginator = cloudtrail_client.get_paginator('lookup_events')
+    
+    # Filter for successful, role-assumed API calls
+    for response in paginator.paginate(
+        LookupAttributes=[
+            {'AttributeKey': 'EventSource', 'AttributeValue': r'.*\.amazonaws\.com'},
+            {'AttributeKey': 'ReadOnly', 'AttributeValue': 'false'} # Look for Write/Config events
+        ],
+        StartTime=start_time,
+        EndTime=end_time
+    ):
+        for event in response.get('Events', []):
+            try:
+                # 1. Check for successful event
+                event_data = json.loads(event['CloudTrailEvent'])
+                if event_data.get('errorCode') or event_data.get('errorMessage'):
+                    continue # Skip failed events
+
+                # 2. Extract Identity ARN
+                user_identity = event_data.get('userIdentity', {})
+                if user_identity.get('type') == 'AssumedRole':
+                    role_arn = user_identity['sessionContext']['sessionIssuer']['arn']
+                    event_action = event_data.get('eventName')
+                    event_source = event_data.get('eventSource')
+                    
+                    if role_arn and event_action and event_source:
+                        action = f"{event_source.split('.')[0]}:{event_action}"
+                        
+                        if role_arn not in used_actions_by_role:
+                            used_actions_by_role[role_arn] = set()
+                        
+                        used_actions_by_role[role_arn].add(action)
+
+            except Exception as e:
+                # Log parsing errors but continue processing other events
+                print(f"Error parsing CloudTrail event: {e}")
+                continue
+    
+    # Convert sets to lists for transmission
+    used_actions_list = {arn: list(actions) for arn, actions in used_actions_by_role.items()}
+    
+    # Write usage data to the Graph
+    save_cloudtrail_data_to_neptune(used_actions_list, start_time) 
+    
+    return used_actions_list
+
 # --- Update the Existing handler function ---
 def handler(event, context):
     """
-    Main Lambda handler (Updated to call collect_iam_data).
+    Main Lambda handler (Updated to call collect_cloudtrail_usage).
     """
     target_role_arn = CUSTOMER_ROLE_ARN 
     
     session = assume_customer_role(target_role_arn)
 
     if session is None:
-        # Keep the existing error handling from S1.A1
         return {
             'statusCode': 500,
             'body': json.dumps({'message': 'Failed to assume customer role.'})
@@ -122,23 +186,25 @@ def handler(event, context):
         identity = sts_client_customer.get_caller_identity()
         customer_account_id = identity['Account']
         
-        # --- NEW CALL: Collect IAM Data ---
-        collected_data = collect_iam_data(session, customer_account_id)
-        # ----------------------------------
+        # --- Collect IAM Data (S1.A2) ---
+        collected_iam_data = collect_iam_data(session, customer_account_id)
+        
+        # --- NEW CALL: Collect CloudTrail Data (S1.A3) ---
+        collected_usage_data = collect_cloudtrail_usage(session, customer_account_id)
+        # ------------------------------------------------
 
         return {
             'statusCode': 200,
             'body': json.dumps({
-                'message': f'Role assumption and IAM data collection successful. Found {len(collected_data)} roles.',
+                'message': f'Collection successful. Found {len(collected_iam_data)} roles and {len(collected_usage_data)} roles with recent usage.',
                 'account_id': customer_account_id
             })
         }
 
     except Exception as e:
-        # Broad error catch for IAM collection or graph write failure
         return {
             'statusCode': 500,
-            'body': json.dumps({'message': f'Collection or Graph write failed: {e}'})
+            'body': json.dumps({'message': f'Fatal error during collection: {e}'})
         }
 
 # For local testing (optional)
