@@ -55,3 +55,79 @@ resource "aws_neptune_cluster_instance" "identity_graph_instance" {
   instance_class    = "db.t4g.medium" # Cost-effective instance type
   engine            = "neptune"
 }
+
+# 1. IAM Policy: Grants permission to assume roles and write logs
+resource "aws_iam_policy" "collector_policy" {
+  name        = "iei-collector-policy-${var.environment}"
+  description = "Grants STS AssumeRole and CloudWatch logging permissions."
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      # Required for logging
+      {
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "arn:aws:logs:*:*:*"
+        Effect   = "Allow"
+      },
+      # CRITICAL: Permission to assume ANY role (we restrict this later)
+      {
+        Action   = "sts:AssumeRole"
+        Resource = "*" # Allows assuming any role ARN passed to it
+        Effect   = "Allow"
+      }
+    ]
+  })
+}
+
+# 2. IAM Role: Assumed by the Lambda function
+resource "aws_iam_role" "collector_role" {
+  name               = "iei-collector-role-${var.environment}"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
+      }
+    ]
+  })
+  tags = {
+    Name = "IEI Collector Role"
+  }
+}
+
+# 3. Attach the policy to the role
+resource "aws_iam_role_policy_attachment" "collector_policy_attach" {
+  role       = aws_iam_role.collector_role.name
+  policy_arn = aws_iam_policy.collector_policy.arn
+}
+
+# 1. Package the Python code into a deployable zip file
+data "archive_file" "collector_zip" {
+  type        = "zip"
+  source_file = "lambda/collector/collector_handler.py"
+  output_path = "lambda/collector/collector_handler.zip"
+}
+
+# 2. Define the Lambda Function
+resource "aws_lambda_function" "collector_lambda" {
+  filename         = data.archive_file.collector_zip.output_path
+  function_name    = "IEICollectorHandler-${var.environment}"
+  role             = aws_iam_role.collector_role.arn
+  handler          = "collector_handler.handler" # file.function
+  source_code_hash = data.archive_file.collector_zip.output_base64sha256
+  runtime          = "python3.12"
+  timeout          = 30 # 30 seconds should be sufficient for API calls
+  
+  tags = {
+    Name = "IEI Collector Function"
+  }
+}
